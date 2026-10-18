@@ -2,6 +2,8 @@ package eu.kanade.tachiyomi.animeextension.en.animepahe
 
 import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
+import eu.kanade.tachiyomi.animeextension.en.animepahe.dto.AniZipEpisodeDto
+import eu.kanade.tachiyomi.animeextension.en.animepahe.dto.AniZipResponseDto
 import eu.kanade.tachiyomi.animeextension.en.animepahe.dto.EpisodeDto
 import eu.kanade.tachiyomi.animeextension.en.animepahe.dto.LatestAnimeDto
 import eu.kanade.tachiyomi.animeextension.en.animepahe.dto.ResponseDto
@@ -33,6 +35,7 @@ import kotlinx.coroutines.sync.withLock
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
+import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.io.IOException
 import java.text.SimpleDateFormat
@@ -152,6 +155,10 @@ class AnimePahe :
     override fun animeDetailsParse(response: Response): SAnime {
         val document = response.useAsJsoup()
         val animeId = document.selectFirst("meta[name=id]")?.attr("content")
+
+        if (animeId != null) {
+            saveMalIdToCache(animeId, parseMalId(document).orEmpty())
+        }
 
         return SAnime.create().apply {
             if (animeId != null) {
@@ -479,8 +486,8 @@ class AnimePahe :
         val requestUrl = response.request.url
         var currentData = response.parseAs<ResponseDto<EpisodeDto>>()
 
-        if (currentData.items.isNotEmpty()) {
-            val animeId = currentData.items.first().animeId.toString()
+        val animeId = currentData.items.firstOrNull()?.animeId?.toString()
+        if (animeId != null) {
             saveSessionToCache(animeId, session)
         }
 
@@ -504,18 +511,70 @@ class AnimePahe :
 
         val showSiteEpisodeNumber = preferences.getBoolean(PREF_SHOW_SITE_NUMBER_KEY, PREF_SHOW_SITE_NUMBER_DEFAULT)
 
+        val episodeInfo = if (animeId != null && preferences.getBoolean(PREF_EPISODE_INFO_KEY, PREF_EPISODE_INFO_DEFAULT)) {
+            fetchEpisodeInfo(animeId, session)
+        } else {
+            emptyMap()
+        }
+        // Sequels on the site may continue numbering from the previous season (e.g. 13, 14, ...),
+        // while ani.zip numbers episodes per MAL entry starting from 1.
+        val numberOffset = episodeList.firstOrNull()?.let { maxOf(floor(it.episode_number) - 1f, 0f) } ?: 0f
+
         return episodeList.mapIndexed { index, episode ->
             val siteEpisodeNumber = episode.name.removePrefix("Episode ")
+            val relativeNumber = episode.episode_number - numberOffset
+            val info = if (floor(relativeNumber) == relativeNumber) episodeInfo[relativeNumber.toInt()] else null
             episode.apply {
                 episode_number = (index + 1).toFloat()
-                name = if (showSiteEpisodeNumber && siteEpisodeNumber != (index + 1).toString()) {
+                val baseName = if (showSiteEpisodeNumber && siteEpisodeNumber != (index + 1).toString()) {
                     "Episode ${index + 1} ($siteEpisodeNumber)"
                 } else {
                     "Episode ${index + 1}"
                 }
+                name = info?.resolvedTitle?.let { "$baseName: $it" } ?: baseName
+                info?.resolvedSummary?.let { summary = it }
+                info?.image?.takeIf { it.isNotBlank() }?.let { preview_url = it }
             }
         }.reversed()
     }
+
+    /**
+     * Fetches episode titles, summaries and thumbnails from ani.zip using the anime's MAL ID.
+     * Returns an empty map on any failure so the episode list still loads.
+     */
+    private suspend fun fetchEpisodeInfo(animeId: String, session: String): Map<Int, AniZipEpisodeDto> = try {
+        val malId = getMalIdFromCache(animeId) ?: fetchMalId(animeId, session)
+        if (malId.isNullOrEmpty()) {
+            emptyMap()
+        } else {
+            network.client.newCall(GET("$ANIZIP_URL?mal_id=$malId")).awaitSuccess()
+                .parseAs<AniZipResponseDto>()
+                .episodes
+                .mapNotNull { (number, episode) -> number.toIntOrNull()?.let { it to episode } }
+                .toMap()
+        }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (_: Exception) {
+        emptyMap()
+    }
+
+    private suspend fun fetchMalId(animeId: String, session: String): String? {
+        delay(1000.milliseconds)
+        val response = safeApiCall(GET("$baseUrl/anime/$session", headers))
+        if (!response.isSuccessful) {
+            response.close()
+            return null
+        }
+        val malId = parseMalId(response.useAsJsoup()).orEmpty()
+        saveMalIdToCache(animeId, malId)
+        return malId
+    }
+
+    private fun parseMalId(document: Document): String? = document
+        .selectFirst("div.col-sm-4.anime-info p:contains(External Links:) a[href*=myanimelist.net/anime/]")
+        ?.attr("href")
+        ?.let { MAL_ID_REGEX.find(it)?.groupValues?.get(1) }
 
     private fun parseEpisodePage(episodes: List<EpisodeDto>, animeSession: String): MutableList<SEpisode> = episodes.map { episode ->
         SEpisode.create().apply {
@@ -763,6 +822,12 @@ class AnimePahe :
             default = PREF_SHOW_SITE_NUMBER_DEFAULT,
         )
         screen.addSwitchPreference(
+            key = PREF_EPISODE_INFO_KEY,
+            title = PREF_EPISODE_INFO_TITLE,
+            summary = PREF_EPISODE_INFO_SUMMARY,
+            default = PREF_EPISODE_INFO_DEFAULT,
+        )
+        screen.addSwitchPreference(
             key = PREF_LINK_TYPE_KEY,
             title = PREF_LINK_TYPE_TITLE,
             summary = PREF_LINK_TYPE_SUMMARY,
@@ -821,6 +886,16 @@ class AnimePahe :
     private fun getSessionFromCache(animeId: String): String? = preferences.getString("session_cache_$animeId", null)
 
     private fun getIdFromCache(session: String): String? = preferences.getString("id_cache_$session", null)
+
+    // An empty string means the anime page has no MAL link, so we don't refetch the page every time.
+    private fun saveMalIdToCache(animeId: String, malId: String) {
+        val key = "mal_cache_$animeId"
+        if (preferences.getString(key, null) != malId) {
+            preferences.edit().putString(key, malId).apply()
+        }
+    }
+
+    private fun getMalIdFromCache(animeId: String): String? = preferences.getString("mal_cache_$animeId", null)
 
     private suspend fun fetchSessionAndId(animeId: String?, title: String?): Pair<String, String>? {
         if (title.isNullOrBlank()) return null
@@ -989,6 +1064,14 @@ class AnimePahe :
         private const val PREF_SHOW_SITE_NUMBER_TITLE = "Show Site Episode Number"
         private const val PREF_SHOW_SITE_NUMBER_DEFAULT = false
         private const val PREF_SHOW_SITE_NUMBER_SUMMARY = "Show the actual episode number from the site in the episode title"
+
+        private const val ANIZIP_URL = "https://api.ani.zip/mappings"
+        private val MAL_ID_REGEX = Regex("""myanimelist\.net/anime/(\d+)""")
+
+        private const val PREF_EPISODE_INFO_KEY = "pref_episode_info"
+        private const val PREF_EPISODE_INFO_TITLE = "Fetch Episode Titles"
+        private const val PREF_EPISODE_INFO_DEFAULT = true
+        private const val PREF_EPISODE_INFO_SUMMARY = "Fetch episode titles, summaries and thumbnails from ani.zip using the anime's MyAnimeList ID"
 
         const val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
         private const val PREF_CF_UA_KEY = "cf_bypass_ua"
