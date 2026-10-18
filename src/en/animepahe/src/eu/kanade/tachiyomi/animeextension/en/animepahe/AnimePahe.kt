@@ -4,6 +4,7 @@ import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.animeextension.en.animepahe.dto.AniZipEpisodeDto
 import eu.kanade.tachiyomi.animeextension.en.animepahe.dto.AniZipResponseDto
+import eu.kanade.tachiyomi.animeextension.en.animepahe.dto.AnimeScheduleResponseDto
 import eu.kanade.tachiyomi.animeextension.en.animepahe.dto.EpisodeDto
 import eu.kanade.tachiyomi.animeextension.en.animepahe.dto.LatestAnimeDto
 import eu.kanade.tachiyomi.animeextension.en.animepahe.dto.ResponseDto
@@ -29,9 +30,14 @@ import keiyoushi.utils.parseAs
 import keiyoushi.utils.tryParse
 import keiyoushi.utils.useAsJsoup
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
@@ -40,6 +46,7 @@ import org.jsoup.nodes.Element
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Locale
+import java.util.TimeZone
 import kotlin.math.ceil
 import kotlin.math.floor
 import kotlin.time.Duration.Companion.milliseconds
@@ -511,18 +518,30 @@ class AnimePahe :
 
         val showSiteEpisodeNumber = preferences.getBoolean(PREF_SHOW_SITE_NUMBER_KEY, PREF_SHOW_SITE_NUMBER_DEFAULT)
 
-        val episodeInfo = if (animeId != null && preferences.getBoolean(PREF_EPISODE_INFO_KEY, PREF_EPISODE_INFO_DEFAULT)) {
-            fetchEpisodeInfo(animeId, session)
-        } else {
-            emptyMap()
-        }
+        val fetchTitles = preferences.getBoolean(PREF_EPISODE_INFO_KEY, PREF_EPISODE_INFO_DEFAULT)
+        val checkDub = preferences.getBoolean(PREF_DUB_CHECK_KEY, PREF_DUB_CHECK_DEFAULT)
+        val malId = if (animeId != null && (fetchTitles || checkDub)) getMalId(animeId, session) else null
+
+        val episodeInfo = if (malId != null && fetchTitles) fetchEpisodeInfo(malId) else emptyMap()
         // Sequels on the site may continue numbering from the previous season (e.g. 13, 14, ...),
-        // while ani.zip numbers episodes per MAL entry starting from 1.
+        // while ani.zip and AnimeSchedule number episodes per MAL entry starting from 1.
         val numberOffset = episodeList.firstOrNull()?.let { maxOf(floor(it.episode_number) - 1f, 0f) } ?: 0f
+        val relativeNumbers = episodeList.map { it.episode_number - numberOffset }
+
+        if (checkDub) {
+            val dubbedCount = malId?.let { estimateDubbedEpisodes(it) } ?: 0
+            applyAudioInfo(
+                episodeList.filterIndexed { index, episode ->
+                    relativeNumbers[index] <= dubbedCount || episode.scanlator != LABEL_SUB
+                },
+            )
+        } else {
+            episodeList.forEach { it.scanlator = null }
+        }
 
         return episodeList.mapIndexed { index, episode ->
             val siteEpisodeNumber = episode.name.removePrefix("Episode ")
-            val relativeNumber = episode.episode_number - numberOffset
+            val relativeNumber = relativeNumbers[index]
             val info = if (floor(relativeNumber) == relativeNumber) episodeInfo[relativeNumber.toInt()] else null
             episode.apply {
                 episode_number = (index + 1).toFloat()
@@ -542,21 +561,132 @@ class AnimePahe :
      * Fetches episode titles, summaries and thumbnails from ani.zip using the anime's MAL ID.
      * Returns an empty map on any failure so the episode list still loads.
      */
-    private suspend fun fetchEpisodeInfo(animeId: String, session: String): Map<Int, AniZipEpisodeDto> = try {
-        val malId = getMalIdFromCache(animeId) ?: fetchMalId(animeId, session)
-        if (malId.isNullOrEmpty()) {
-            emptyMap()
-        } else {
-            network.client.newCall(GET("$ANIZIP_URL?mal_id=$malId")).awaitSuccess()
-                .parseAs<AniZipResponseDto>()
-                .episodes
-                .mapNotNull { (number, episode) -> number.toIntOrNull()?.let { it to episode } }
-                .toMap()
-        }
+    private suspend fun fetchEpisodeInfo(malId: String): Map<Int, AniZipEpisodeDto> = try {
+        network.client.newCall(GET("$ANIZIP_URL?mal_id=$malId")).awaitSuccess()
+            .parseAs<AniZipResponseDto>()
+            .episodes
+            .mapNotNull { (number, episode) -> number.toIntOrNull()?.let { it to episode } }
+            .toMap()
     } catch (e: CancellationException) {
         throw e
     } catch (_: Exception) {
         emptyMap()
+    }
+
+    private suspend fun getMalId(animeId: String, session: String): String? = try {
+        (getMalIdFromCache(animeId) ?: fetchMalId(animeId, session))?.takeIf { it.isNotEmpty() }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (_: Exception) {
+        null
+    }
+
+    // ============================== Sub/Dub ===============================
+
+    /**
+     * Estimates how many episodes have an English dub out, from AnimeSchedule's dub premiere date
+     * assuming one dubbed episode per week. It overshoots on purpose (breaks aren't subtracted,
+     * plus a margin for batch premieres), since every episode in range is confirmed on AnimePahe.
+     */
+    private suspend fun estimateDubbedEpisodes(malId: String): Int {
+        val dubPremier = getDubPremier(malId) ?: return 0
+        val now = System.currentTimeMillis()
+        if (dubPremier <= 0L || dubPremier > now) return 0
+        return ((now - dubPremier) / WEEK_MS).toInt() + 1 + DUB_ESTIMATE_MARGIN
+    }
+
+    /** Dub premiere in epoch millis, 0 if the anime has no dub, or null if AnimeSchedule couldn't be reached. */
+    private suspend fun getDubPremier(malId: String): Long? {
+        val key = "dub_premier_$malId"
+        val now = System.currentTimeMillis()
+        preferences.getString(key, null)?.split("|")?.takeIf { it.size == 2 }?.let { (premier, fetchedAt) ->
+            if (now - (fetchedAt.toLongOrNull() ?: 0L) < DAY_MS) return premier.toLongOrNull()
+        }
+
+        val premier = try {
+            network.client.newCall(GET("$ANIMESCHEDULE_URL?mal-ids=$malId")).awaitSuccess()
+                .parseAs<AnimeScheduleResponseDto>()
+                .anime.firstOrNull()?.dubPremier
+                ?.let { ISO_DATE_FORMATTER.tryParse(it) }
+                ?.coerceAtLeast(0L)
+                ?: 0L
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            return null
+        }
+        preferences.edit().putString(key, "$premier|$now").apply()
+        return premier
+    }
+
+    /**
+     * Works out which of [candidates] have sub and/or English dub uploads on AnimePahe by checking
+     * their play pages, since the release API's `audio` field only describes one upload. Results are
+     * cached per episode: once a dub is found it's kept forever, while sub-only episodes newer than
+     * [DUB_RECHECK_WINDOW_MS] are rechecked at most daily.
+     */
+    private suspend fun applyAudioInfo(candidates: List<SEpisode>) {
+        val now = System.currentTimeMillis()
+        val toCheck = candidates.filter { episode ->
+            val cached = preferences.getString(audioCacheKey(episode), null)?.split("|")
+            val audio = cached?.getOrNull(0)
+            audio?.let { episode.scanlator = audioLabel(it) }
+            when {
+                audio == null -> true
+                AUDIO_DUB in audio -> false
+                now - episode.date_upload > DUB_RECHECK_WINDOW_MS -> false
+                else -> now - (cached.getOrNull(1)?.toLongOrNull() ?: 0L) > DAY_MS
+            }
+        }
+        if (toCheck.isEmpty()) return
+
+        val semaphore = Semaphore(DUB_CHECK_CONCURRENCY)
+        coroutineScope {
+            toCheck.sortedByDescending { it.episode_number }
+                .take(DUB_CHECK_LIMIT)
+                .map { episode ->
+                    async {
+                        semaphore.withPermit {
+                            val audio = fetchAudio(episode) ?: return@withPermit
+                            preferences.edit().putString(audioCacheKey(episode), "$audio|$now").apply()
+                            episode.scanlator = audioLabel(audio)
+                        }
+                    }
+                }
+                .awaitAll()
+        }
+    }
+
+    /** Returns [AUDIO_SUB] and/or [AUDIO_DUB] for the uploads on the episode's play page, or null if it couldn't be read. */
+    private suspend fun fetchAudio(episode: SEpisode): String? = try {
+        val response = safeApiCall(GET("$baseUrl${episode.url.substringBefore("?")}", headers))
+        if (response.isSuccessful) {
+            val buttons = response.useAsJsoup().select("div#resolutionMenu > button")
+            buildString {
+                if (buttons.any { it.attr("data-audio") == "jpn" }) append(AUDIO_SUB)
+                if (buttons.any { it.attr("data-audio") == "eng" }) append(AUDIO_DUB)
+            }.ifEmpty { null }
+        } else {
+            response.close()
+            null
+        }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun audioCacheKey(episode: SEpisode) = "audio_cache_" + episode.url.substringBefore("?").substringAfterLast("/")
+
+    private fun audioLabel(audio: String): String = listOfNotNull(
+        LABEL_SUB.takeIf { AUDIO_SUB in audio },
+        LABEL_DUB.takeIf { AUDIO_DUB in audio },
+    ).joinToString(" · ")
+
+    /** Best guess from the release API until the play page is checked: non-Japanese audio means a dub was uploaded too. */
+    private fun apiAudioLabel(audio: String?): String = when (audio?.lowercase()) {
+        null, "", "jpn" -> audioLabel(AUDIO_SUB)
+        else -> audioLabel(AUDIO_SUB + AUDIO_DUB)
     }
 
     private suspend fun fetchMalId(animeId: String, session: String): String? {
@@ -589,6 +719,7 @@ class AnimePahe :
                 epNum.toString()
             }
             name = "Episode $epName"
+            scanlator = apiAudioLabel(episode.audio)
         }
     }.toMutableList()
 
@@ -826,6 +957,12 @@ class AnimePahe :
             title = PREF_EPISODE_INFO_TITLE,
             summary = PREF_EPISODE_INFO_SUMMARY,
             default = PREF_EPISODE_INFO_DEFAULT,
+        )
+        screen.addSwitchPreference(
+            key = PREF_DUB_CHECK_KEY,
+            title = PREF_DUB_CHECK_TITLE,
+            summary = PREF_DUB_CHECK_SUMMARY,
+            default = PREF_DUB_CHECK_DEFAULT,
         )
         screen.addSwitchPreference(
             key = PREF_LINK_TYPE_KEY,
@@ -1072,6 +1209,26 @@ class AnimePahe :
         private const val PREF_EPISODE_INFO_TITLE = "Fetch Episode Titles"
         private const val PREF_EPISODE_INFO_DEFAULT = true
         private const val PREF_EPISODE_INFO_SUMMARY = "Fetch episode titles, summaries and thumbnails from ani.zip using the anime's MyAnimeList ID"
+
+        private const val ANIMESCHEDULE_URL = "https://animeschedule.net/api/v3/anime"
+        private val ISO_DATE_FORMATTER by lazy {
+            SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.ENGLISH).apply { timeZone = TimeZone.getTimeZone("UTC") }
+        }
+        private const val LABEL_SUB = "Sub"
+        private const val LABEL_DUB = "Dub"
+        private const val AUDIO_SUB = "s"
+        private const val AUDIO_DUB = "d"
+        private const val DAY_MS = 24 * 60 * 60 * 1000L
+        private const val WEEK_MS = 7 * DAY_MS
+        private const val DUB_RECHECK_WINDOW_MS = 90 * DAY_MS
+        private const val DUB_ESTIMATE_MARGIN = 4
+        private const val DUB_CHECK_LIMIT = 30
+        private const val DUB_CHECK_CONCURRENCY = 2
+
+        private const val PREF_DUB_CHECK_KEY = "pref_dub_check"
+        private const val PREF_DUB_CHECK_TITLE = "Show Sub/Dub"
+        private const val PREF_DUB_CHECK_DEFAULT = true
+        private const val PREF_DUB_CHECK_SUMMARY = "Mark episodes that have an English dub on AnimePahe. Uses AnimeSchedule to find shows with a dub, then checks those episodes (results are cached)"
 
         const val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
         private const val PREF_CF_UA_KEY = "cf_bypass_ua"

@@ -38,6 +38,18 @@ data class EpisodeDto(
     val session: String,
     @SerialName("episode") val episodeNumber: Float,
     @SerialName("anime_id") val animeId: Int,
+    // Audio of the episode's main upload; stays "jpn" even when an English dub is also uploaded.
+    val audio: String? = null,
+)
+
+@Serializable
+data class AnimeScheduleResponseDto(
+    val anime: List<AnimeScheduleAnimeDto> = emptyList(),
+)
+
+@Serializable
+data class AnimeScheduleAnimeDto(
+    val dubPremier: String? = null,
 )
 
 @Serializable
