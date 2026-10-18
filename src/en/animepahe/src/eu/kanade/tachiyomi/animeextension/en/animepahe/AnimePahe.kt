@@ -2,6 +2,9 @@ package eu.kanade.tachiyomi.animeextension.en.animepahe
 
 import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
+import aniyomi.lib.anilib.AniLib
+import aniyomi.lib.anilib.DescriptionOptions
+import aniyomi.lib.anilib.buildDescription
 import eu.kanade.tachiyomi.animeextension.en.animepahe.dto.AniZipEpisodeDto
 import eu.kanade.tachiyomi.animeextension.en.animepahe.dto.AniZipResponseDto
 import eu.kanade.tachiyomi.animeextension.en.animepahe.dto.AnimeScheduleResponseDto
@@ -45,6 +48,7 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.io.IOException
 import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import kotlin.math.ceil
@@ -139,7 +143,7 @@ class AnimePahe :
         val response = safeApiCall(request)
 
         if (response.isSuccessful) {
-            return response.use { animeDetailsParse(it) }
+            return detailsFromResponse(response)
         }
         response.close()
 
@@ -153,14 +157,24 @@ class AnimePahe :
         val newRequest = GET("$baseUrl/anime/$newSession", headers)
         val newResponse = safeApiCall(newRequest)
         if (newResponse.isSuccessful) {
-            return newResponse.use { animeDetailsParse(it) }
+            return detailsFromResponse(newResponse)
         }
         newResponse.close()
         throw IOException("HTTP ${newResponse.code} fetching details for '${anime.title}' (ID: $newId) at ${newRequest.url}")
     }
 
-    override fun animeDetailsParse(response: Response): SAnime {
+    private fun detailsFromResponse(response: Response): SAnime {
         val document = response.useAsJsoup()
+        val anime = parseAnimeDetails(document)
+        if (preferences.getBoolean(PREF_ANILIST_DETAILS_KEY, PREF_ANILIST_DETAILS_DEFAULT)) {
+            enrichWithAniList(anime, document)
+        }
+        return anime
+    }
+
+    override fun animeDetailsParse(response: Response): SAnime = parseAnimeDetails(response.useAsJsoup())
+
+    private fun parseAnimeDetails(document: Document): SAnime {
         val animeId = document.selectFirst("meta[name=id]")?.attr("content")
 
         if (animeId != null) {
@@ -185,27 +199,104 @@ class AnimePahe :
                     "div.col-sm-4.anime-info p:contains(Theme:) a",
             )
                 .joinToString { it.text() }
-            description = StringBuilder().apply {
-                append(document.select("div.anime-summary").text())
-                document.selectFirst("div.col-sm-4.anime-info p:contains(Synonyms:)")?.text()
-                    .takeIf { !it.isNullOrBlank() }
-                    ?.let { append("\n\n$it") }
-                document.selectFirst("div.col-sm-4.anime-info p:contains(Japanese:)")?.text()
-                    .takeIf { !it.isNullOrBlank() }
-                    ?.let { append("\n\n$it") }
-                document.selectFirst("div.col-sm-4.anime-info p:contains(Aired:)")?.text()
-                    .takeIf { !it.isNullOrBlank() }
-                    ?.let { append("\n\n$it") }
-                document.selectFirst("div.col-sm-4.anime-info p:contains(Season:)")?.text()
-                    .takeIf { !it.isNullOrBlank() }
-                    ?.let { append("\n\n$it") }
-                document.select("div.col-sm-4.anime-info p:contains(External Links:) a")
-                    .joinToString { "[${it.ownText()}](${it.attr("abs:href")})" }
-                    .takeIf { it.isNotBlank() }
-                    ?.let { append("\n\n*External Links:* $it") }
-            }.toString()
+            description = listOfNotNull(
+                document.select("div.anime-summary").text(),
+                paheInfo(document, "Synonyms"),
+                paheInfo(document, "Japanese"),
+                paheInfo(document, "Aired"),
+                paheInfo(document, "Season"),
+                paheExternalLinks(document),
+            ).joinToString("\n\n")
         }
     }
+
+    private fun paheInfo(document: Document, label: String): String? = document
+        .selectFirst("div.col-sm-4.anime-info p:contains($label:)")?.text()
+        ?.takeIf { it.isNotBlank() }
+
+    private fun paheExternalLinks(document: Document): String? = document
+        .select("div.col-sm-4.anime-info p:contains(External Links:) a")
+        .joinToString { "[${it.ownText()}](${it.attr("abs:href")})" }
+        .takeIf { it.isNotBlank() }
+        ?.let { "*External Links:* $it" }
+
+    // ============================== AniList ===============================
+
+    /**
+     * Rebuilds the description with AniList metadata (score, format, studio, source, next episode,
+     * related seasons, trailer and a fuller synopsis) and adds AniList genres and top tags.
+     * Leaves the AnimePahe details untouched if AniList can't be reached.
+     */
+    private fun enrichWithAniList(anime: SAnime, document: Document) {
+        val media = try {
+            val anilistId = getAniListId(document) ?: return
+            AniLib.fetchMediaDetails(network.client, anilistId, preferences, ANILIST_CACHE_TTL_MS) ?: return
+        } catch (_: Exception) {
+            return
+        }
+
+        val noSynopsis = media.copy(description = null)
+        val overview = noSynopsis.buildDescription(
+            DescriptionOptions(genres = false, tags = false, synonyms = false, relations = false, trailer = false),
+        )
+        val related = noSynopsis.buildDescription(
+            DescriptionOptions(
+                genres = false, tags = false, score = false, status = false, format = false,
+                episodes = false, duration = false, season = false, studio = false,
+            ),
+        )
+        val synopsis = media.buildDescription(DESCRIPTION_SYNOPSIS_ONLY)
+            .ifBlank { document.select("div.anime-summary").text() }
+
+        val header = listOfNotNull(
+            overview,
+            media.nextAiringEpisode?.takeIf { it.airingAt > 0 }?.let {
+                "**Next episode:** ${it.episode} on ${NEXT_EPISODE_FORMATTER.format(Date(it.airingAt * 1000))}"
+            },
+            media.source?.takeIf { it.isNotBlank() }?.let { "**Source:** ${formatAniListEnum(it)}" },
+            related,
+        ).filter { it.isNotBlank() }.joinToString("\n\n")
+
+        anime.description = listOfNotNull(
+            header.takeIf { it.isNotBlank() }?.let { "$it\n\n---" },
+            synopsis,
+            paheInfo(document, "Japanese"),
+            paheInfo(document, "Aired"),
+            paheExternalLinks(document),
+        ).filter { it.isNotBlank() }.joinToString("\n\n")
+
+        val topTags = media.tags.orEmpty()
+            .filter { !it.isGeneralSpoiler && !it.isMediaSpoiler && (it.rank ?: 0) >= ANILIST_MIN_TAG_RANK }
+            .sortedByDescending { it.rank }
+            .take(ANILIST_MAX_TAGS)
+            .mapNotNull { it.name }
+        anime.genre = (anime.genre.orEmpty().split(",") + media.genres + topTags)
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinctBy { it.lowercase() }
+            .joinToString()
+    }
+
+    /** AniList ID from the anime page's external links, or resolved from its MAL ID via ani.zip. */
+    private fun getAniListId(document: Document): Int? = document
+        .selectFirst("div.col-sm-4.anime-info p:contains(External Links:) a[href*=anilist.co/anime/]")
+        ?.attr("href")
+        ?.let { ANILIST_ID_REGEX.find(it)?.groupValues?.get(1)?.toIntOrNull() }
+        ?: parseMalId(document)?.let { aniListIdFromMal(it) }
+
+    private fun aniListIdFromMal(malId: String): Int? {
+        val key = "anilist_from_mal_$malId"
+        preferences.getString(key, null)?.let { return it.toIntOrNull() }
+        val anilistId = network.client.newCall(GET("$ANIZIP_URL?mal_id=$malId")).execute().use { response ->
+            if (!response.isSuccessful) return null
+            response.parseAs<AniZipResponseDto>().mappings?.anilistId
+        }
+        preferences.edit().putString(key, anilistId?.toString().orEmpty()).apply()
+        return anilistId
+    }
+
+    private fun formatAniListEnum(value: String): String = value.split("_")
+        .joinToString(" ") { word -> word.lowercase().replaceFirstChar { it.uppercase() } }
 
     // ============================== Popular ===============================
     override fun popularAnimeRequest(page: Int): Request = GET("$baseUrl/api?m=airing&page=$page")
@@ -965,6 +1056,12 @@ class AnimePahe :
             default = PREF_DUB_CHECK_DEFAULT,
         )
         screen.addSwitchPreference(
+            key = PREF_ANILIST_DETAILS_KEY,
+            title = PREF_ANILIST_DETAILS_TITLE,
+            summary = PREF_ANILIST_DETAILS_SUMMARY,
+            default = PREF_ANILIST_DETAILS_DEFAULT,
+        )
+        screen.addSwitchPreference(
             key = PREF_LINK_TYPE_KEY,
             title = PREF_LINK_TYPE_TITLE,
             summary = PREF_LINK_TYPE_SUMMARY,
@@ -1224,6 +1321,21 @@ class AnimePahe :
         private const val DUB_ESTIMATE_MARGIN = 4
         private const val DUB_CHECK_LIMIT = 30
         private const val DUB_CHECK_CONCURRENCY = 2
+
+        private val ANILIST_ID_REGEX = Regex("""anilist\.co/anime/(\d+)""")
+        private const val ANILIST_CACHE_TTL_MS = 6 * 60 * 60 * 1000L
+        private const val ANILIST_MIN_TAG_RANK = 60
+        private const val ANILIST_MAX_TAGS = 10
+        private val DESCRIPTION_SYNOPSIS_ONLY = DescriptionOptions(
+            genres = false, tags = false, score = false, status = false, format = false, episodes = false,
+            duration = false, season = false, studio = false, synonyms = false, relations = false, trailer = false,
+        )
+        private val NEXT_EPISODE_FORMATTER by lazy { SimpleDateFormat("EEE, MMM d 'at' h:mm a", Locale.ENGLISH) }
+
+        private const val PREF_ANILIST_DETAILS_KEY = "pref_anilist_details"
+        private const val PREF_ANILIST_DETAILS_TITLE = "Fetch AniList Details"
+        private const val PREF_ANILIST_DETAILS_DEFAULT = true
+        private const val PREF_ANILIST_DETAILS_SUMMARY = "Add score, studio, source, next episode, related seasons, tags and a fuller synopsis from AniList"
 
         private const val PREF_DUB_CHECK_KEY = "pref_dub_check"
         private const val PREF_DUB_CHECK_TITLE = "Show Sub/Dub"

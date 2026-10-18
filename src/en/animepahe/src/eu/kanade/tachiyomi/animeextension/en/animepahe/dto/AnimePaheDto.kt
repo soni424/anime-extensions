@@ -55,6 +55,12 @@ data class AnimeScheduleAnimeDto(
 @Serializable
 data class AniZipResponseDto(
     val episodes: Map<String, AniZipEpisodeDto> = emptyMap(),
+    val mappings: AniZipMappingsDto? = null,
+)
+
+@Serializable
+data class AniZipMappingsDto(
+    @SerialName("anilist_id") val anilistId: Int? = null,
 )
 
 @Serializable
