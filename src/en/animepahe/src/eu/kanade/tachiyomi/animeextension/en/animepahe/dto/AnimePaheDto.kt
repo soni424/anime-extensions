@@ -43,44 +43,80 @@ data class EpisodeDto(
 )
 
 @Serializable
-data class AnimeScheduleResponseDto(
+class AnimeScheduleResponseDto(
     val anime: List<AnimeScheduleAnimeDto> = emptyList(),
 )
 
 @Serializable
-data class AnimeScheduleAnimeDto(
+class AnimeScheduleAnimeDto(
     val dubPremier: String? = null,
 )
 
+/** Episode title, summary and thumbnail from a metadata source, keyed elsewhere by episode number. */
+class EpisodeMeta(
+    val title: String?,
+    val summary: String?,
+    val image: String?,
+)
+
 @Serializable
-data class AniZipResponseDto(
+class AniZipResponseDto(
     val episodes: Map<String, AniZipEpisodeDto> = emptyMap(),
     val mappings: AniZipMappingsDto? = null,
 )
 
 @Serializable
-data class AniZipMappingsDto(
+class AniZipMappingsDto(
     @SerialName("anilist_id") val anilistId: Int? = null,
+    @SerialName("kitsu_id") val kitsuId: Int? = null,
 )
 
 @Serializable
-data class AniZipEpisodeDto(
-    val title: AniZipTitleDto? = null,
-    val overview: String? = null,
-    val summary: String? = null,
-    val image: String? = null,
+class AniZipEpisodeDto(
+    private val title: AniZipTitleDto? = null,
+    private val overview: String? = null,
+    private val summary: String? = null,
+    private val image: String? = null,
 ) {
-    val resolvedTitle: String?
-        get() = title?.en?.takeIf { it.isNotBlank() }
-            ?: title?.xJat?.takeIf { it.isNotBlank() }
-
-    val resolvedSummary: String?
-        get() = overview?.takeIf { it.isNotBlank() }
-            ?: summary?.takeIf { it.isNotBlank() }
+    fun toEpisodeMeta() = EpisodeMeta(
+        title = title?.en?.takeIf { it.isNotBlank() } ?: title?.xJat?.takeIf { it.isNotBlank() },
+        summary = overview?.takeIf { it.isNotBlank() } ?: summary?.takeIf { it.isNotBlank() },
+        image = image?.takeIf { it.isNotBlank() },
+    )
 }
 
 @Serializable
-data class AniZipTitleDto(
+class AniZipTitleDto(
     val en: String? = null,
     @SerialName("x-jat") val xJat: String? = null,
+)
+
+@Serializable
+class KitsuEpisodesDto(
+    val data: List<KitsuEpisodeDto> = emptyList(),
+)
+
+@Serializable
+class KitsuEpisodeDto(
+    val attributes: KitsuEpisodeAttributesDto,
+)
+
+@Serializable
+class KitsuEpisodeAttributesDto(
+    val number: Int? = null,
+    private val canonicalTitle: String? = null,
+    private val synopsis: String? = null,
+    private val thumbnail: KitsuImageDto? = null,
+) {
+    fun toEpisodeMeta() = EpisodeMeta(
+        title = canonicalTitle?.takeIf { it.isNotBlank() },
+        summary = synopsis?.takeIf { it.isNotBlank() },
+        image = thumbnail?.original ?: thumbnail?.large,
+    )
+}
+
+@Serializable
+class KitsuImageDto(
+    val original: String? = null,
+    val large: String? = null,
 )

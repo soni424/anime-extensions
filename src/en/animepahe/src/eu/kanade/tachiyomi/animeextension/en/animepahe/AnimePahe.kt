@@ -5,10 +5,11 @@ import androidx.preference.PreferenceScreen
 import aniyomi.lib.anilib.AniLib
 import aniyomi.lib.anilib.DescriptionOptions
 import aniyomi.lib.anilib.buildDescription
-import eu.kanade.tachiyomi.animeextension.en.animepahe.dto.AniZipEpisodeDto
 import eu.kanade.tachiyomi.animeextension.en.animepahe.dto.AniZipResponseDto
 import eu.kanade.tachiyomi.animeextension.en.animepahe.dto.AnimeScheduleResponseDto
 import eu.kanade.tachiyomi.animeextension.en.animepahe.dto.EpisodeDto
+import eu.kanade.tachiyomi.animeextension.en.animepahe.dto.EpisodeMeta
+import eu.kanade.tachiyomi.animeextension.en.animepahe.dto.KitsuEpisodesDto
 import eu.kanade.tachiyomi.animeextension.en.animepahe.dto.LatestAnimeDto
 import eu.kanade.tachiyomi.animeextension.en.animepahe.dto.ResponseDto
 import eu.kanade.tachiyomi.animeextension.en.animepahe.dto.SearchResultDto
@@ -613,11 +614,16 @@ class AnimePahe :
         val checkDub = preferences.getBoolean(PREF_DUB_CHECK_KEY, PREF_DUB_CHECK_DEFAULT)
         val malId = if (animeId != null && (fetchTitles || checkDub)) getMalId(animeId, session) else null
 
-        val episodeInfo = if (malId != null && fetchTitles) fetchEpisodeInfo(malId) else emptyMap()
         // Sequels on the site may continue numbering from the previous season (e.g. 13, 14, ...),
-        // while ani.zip and AnimeSchedule number episodes per MAL entry starting from 1.
+        // while ani.zip, Kitsu and AnimeSchedule number episodes per MAL entry starting from 1.
         val numberOffset = episodeList.firstOrNull()?.let { maxOf(floor(it.episode_number) - 1f, 0f) } ?: 0f
         val relativeNumbers = episodeList.map { it.episode_number - numberOffset }
+
+        val episodeInfo = if (malId != null && fetchTitles) {
+            fetchEpisodeInfo(malId, relativeNumbers.filter { floor(it) == it }.map { it.toInt() })
+        } else {
+            emptyMap()
+        }
 
         if (checkDub) {
             val dubbedCount = malId?.let { estimateDubbedEpisodes(it) } ?: 0
@@ -641,27 +647,57 @@ class AnimePahe :
                 } else {
                     "Episode ${index + 1}"
                 }
-                name = info?.resolvedTitle?.let { "$baseName: $it" } ?: baseName
-                info?.resolvedSummary?.let { summary = it }
-                info?.image?.takeIf { it.isNotBlank() }?.let { preview_url = it }
+                name = info?.title?.let { "$baseName: $it" } ?: baseName
+                info?.summary?.let { summary = it }
+                info?.image?.let { preview_url = it }
             }
         }.reversed()
     }
 
     /**
-     * Fetches episode titles, summaries and thumbnails from ani.zip using the anime's MAL ID.
-     * Returns an empty map on any failure so the episode list still loads.
+     * Fetches episode titles, summaries and thumbnails from ani.zip using the anime's MAL ID, then
+     * fills the [wanted] episodes ani.zip has no title for from Kitsu (ani.zip relies on AniDB/TVDB
+     * mappings, which brand-new shows and the latest episodes often don't have yet).
+     * Returns whatever it could get, so the episode list still loads on failure.
      */
-    private suspend fun fetchEpisodeInfo(malId: String): Map<Int, AniZipEpisodeDto> = try {
-        network.client.newCall(GET("$ANIZIP_URL?mal_id=$malId")).awaitSuccess()
-            .parseAs<AniZipResponseDto>()
-            .episodes
-            .mapNotNull { (number, episode) -> number.toIntOrNull()?.let { it to episode } }
+    private suspend fun fetchEpisodeInfo(malId: String, wanted: List<Int>): Map<Int, EpisodeMeta> {
+        val aniZip = try {
+            network.client.newCall(GET("$ANIZIP_URL?mal_id=$malId")).awaitSuccess().parseAs<AniZipResponseDto>()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            return emptyMap()
+        }
+        val info = aniZip.episodes
+            .mapNotNull { (number, episode) -> number.toIntOrNull()?.let { it to episode.toEpisodeMeta() } }
             .toMap()
-    } catch (e: CancellationException) {
-        throw e
-    } catch (_: Exception) {
-        emptyMap()
+
+        val kitsuId = aniZip.mappings?.kitsuId ?: return info
+        val missing = wanted.filter { info[it]?.title == null }
+        if (missing.isEmpty()) return info
+        return info + fetchKitsuEpisodes(kitsuId, missing)
+    }
+
+    private suspend fun fetchKitsuEpisodes(kitsuId: Int, numbers: List<Int>): Map<Int, EpisodeMeta> {
+        val result = mutableMapOf<Int, EpisodeMeta>()
+        try {
+            numbers.distinct().sorted().chunked(KITSU_PAGE_LIMIT).take(KITSU_MAX_REQUESTS).forEach { chunk ->
+                val url = "$KITSU_URL/anime/$kitsuId/episodes".toHttpUrl().newBuilder()
+                    .addQueryParameter("filter[number]", chunk.joinToString(","))
+                    .addQueryParameter("fields[episodes]", "number,canonicalTitle,synopsis,thumbnail")
+                    .addQueryParameter("page[limit]", KITSU_PAGE_LIMIT.toString())
+                    .build()
+                network.client.newCall(GET(url)).awaitSuccess().parseAs<KitsuEpisodesDto>().data.forEach { episode ->
+                    val meta = episode.attributes.toEpisodeMeta()
+                    if (meta.title != null) episode.attributes.number?.let { result[it] = meta }
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            // Keep whatever pages were fetched before the failure.
+        }
+        return result
     }
 
     private suspend fun getMalId(animeId: String, session: String): String? = try {
@@ -1300,12 +1336,15 @@ class AnimePahe :
         private const val PREF_SHOW_SITE_NUMBER_SUMMARY = "Show the actual episode number from the site in the episode title"
 
         private const val ANIZIP_URL = "https://api.ani.zip/mappings"
+        private const val KITSU_URL = "https://kitsu.io/api/edge"
+        private const val KITSU_PAGE_LIMIT = 20
+        private const val KITSU_MAX_REQUESTS = 5
         private val MAL_ID_REGEX = Regex("""myanimelist\.net/anime/(\d+)""")
 
         private const val PREF_EPISODE_INFO_KEY = "pref_episode_info"
         private const val PREF_EPISODE_INFO_TITLE = "Fetch Episode Titles"
         private const val PREF_EPISODE_INFO_DEFAULT = true
-        private const val PREF_EPISODE_INFO_SUMMARY = "Fetch episode titles, summaries and thumbnails from ani.zip using the anime's MyAnimeList ID"
+        private const val PREF_EPISODE_INFO_SUMMARY = "Fetch episode titles, summaries and thumbnails from ani.zip and Kitsu using the anime's MyAnimeList ID"
 
         private const val ANIMESCHEDULE_URL = "https://animeschedule.net/api/v3/anime"
         private val ISO_DATE_FORMATTER by lazy {
